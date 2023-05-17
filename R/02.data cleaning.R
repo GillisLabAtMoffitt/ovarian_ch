@@ -69,6 +69,8 @@ ovarian_info <- left_join(ovarian_info,
                           subsequent_cancer,
                           by = "patient_id")
 
+write_rds(ovarian_info, "ovarian_info.rds")
+
 # Demographic----
 Demographic <- Demographic %>%
   select(-c(is_moffitt_patient, is_active_tcc, is_approached_tcc_consent_oncore))
@@ -126,7 +128,7 @@ Beva <- Chemot %>%
 # Chemotherapy----
 Chemot1 <- Chemot %>% 
   # Limit to ovarian cancer patients
-  filter(str_detect(patient_id, ovarian_patients_id)) %>% 
+  # filter(str_detect(patient_id, ovarian_patients_id)) %>% 
   select(-c(treatment_start_dt_src, treatment_end_dt_src)) %>% 
   mutate(across(where(is.character), ~str_to_lower(.))) %>% 
   # limit to chemotherapy 
