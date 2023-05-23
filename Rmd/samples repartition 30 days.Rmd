@@ -1,0 +1,265 @@
+---
+title: "samples repartition - 30 days time limits on postsample"
+author: "Christelle Colin-Leitzinger"
+date: '`r Sys.Date()`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    theme: united
+    highlight: pygments
+    df_print: kable
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type="text/css">
+
+.figure {
+    margin-top: 100px;
+    margin-bottom: 100px;
+}
+
+table {
+    margin-top: 10px;
+    margin-bottom: 25px !important;
+}
+
+th, td { padding: 5px; }
+
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = FALSE,
+                      fig.align='center'
+                      )
+```
+
+```{r library}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(gtsummary)
+library(viridis)
+library(ggforce)
+library(kableExtra)
+```
+
+```{r load data}
+ovarian_data <- 
+  read_rds(paste0(here::here(), "/ovarian_data_with_blood.rds"))
+```
+
+# Overall data selection
+## Sample types selection
+- collection_site_tissue_type == blood
+- sample_type == Buffy Coat, Genomic DNA, MNC, Unprocessed Liquid Tissue
+
+## Patient characteristics
+- primary_site_group == "ovary" and "fallopian tube"
+
+## Treatment cleaning
+- keep treatment for these selected patients (who has blood samples and breast cancer)
+- remove drugs not used for breast cancer treatment
+- removed drugs which were refused
+
+# Repartition of Samples Before and After Treatments within Time Limits
+
+We focus on the chemotherapy so the samples are not chosen depending of other treatment.
+
+Summary criteria for sample selection:  
+
+* Chemotherapy:  
+  + Pre-sample must be closest to drug start from -365 days to + 5days   
+     + also needs to be before rad or no rad was given  
+  + Sequential sample must be after 30 days from start date  
+
+* Bavacizumab:  
+  + Added a received bevacizumab variable
+
+```{r select samples}
+blood_patients <- ovarian_data %>%
+  # we are interested to find sample before / after chemo 
+  # exclude patients not treated with chemo
+  filter(!is.na(treatment_start_dt_regimen_1)) %>% 
+  # Find Pre-sample
+  arrange(deidentified_patient_id, specimen_collection_dt) %>% 
+  mutate(blood_bf_chemo = case_when(
+    specimen_collection_dt <= (treatment_start_dt_regimen_1 - days(365))    ~ "too early",
+    specimen_collection_dt <= (treatment_start_dt_regimen_1 + days(5))      ~ "Yes",
+    specimen_collection_dt > treatment_start_dt_regimen_1                   ~ "No",
+    is.na(treatment_start_dt_regimen_1)                                     ~ "not administred",
+    TRUE                                                                    ~ "No"
+  )) %>%
+  mutate(across(contains("blood_bf_"), ~ factor(., levels = c("Yes", "No", "too early", "not administred")))) %>%
+  group_by(deidentified_patient_id, patient_id) %>% 
+  mutate(has_a_good_presample_chemo = case_when(
+    if_any(contains("blood_bf_"), ~ . == "Yes")    ~ "Yes"
+  )) %>%
+  
+  # group to use last - choose the closest sample to drug
+  group_by(deidentified_patient_id, has_a_good_presample_chemo) %>%
+  mutate(closest_chemo_presample_date = case_when(
+    has_a_good_presample_chemo == "Yes"            ~ last(specimen_collection_dt)
+  )) %>%
+  mutate(interval_presample_chemo = case_when(
+    closest_chemo_presample_date == specimen_collection_dt  ~
+      (interval(start = closest_chemo_presample_date, end = treatment_start_dt_regimen_1) /
+                 duration(n = 1, units = "days"))
+  )) %>%
+  mutate(presample_id_chemo = case_when(
+    !is.na(interval_presample_chemo)       ~ sample_id
+  )) %>%
+  mutate(presample_date_chemo = case_when(
+    !is.na(presample_id_chemo)                                     ~ specimen_collection_dt
+  )) %>% 
+  ungroup() %>% 
+  
+  # Find Post-sample
+  mutate(presample_chemo_within_limits = has_a_good_presample_chemo) %>% 
+  group_by(deidentified_patient_id) %>%
+  fill(presample_chemo_within_limits,
+       closest_chemo_presample_date, .direction = "updown") %>%
+  ungroup() %>% 
+  mutate(seq_sample_chemo = case_when(
+    presample_chemo_within_limits == "Yes" &
+      blood_bf_chemo == "No" &
+      specimen_collection_dt > 
+      (treatment_start_dt_regimen_1 + days(30)) &
+      specimen_collection_dt >= treatment_end_dt1_regimen_1         ~ "Yes",
+    presample_chemo_within_limits == "Yes" &
+      blood_bf_chemo == "No" &
+      specimen_collection_dt > 
+      (treatment_start_dt_regimen_1 + days(30)) &
+      # change here in case no chemo end date
+      is.na(treatment_end_dt1_regimen_1) &                        
+      specimen_collection_dt >= treatment_start_dt_regimen_1        ~ "Yes but no chemo end date",
+    TRUE                                                            ~ NA_character_
+  )) %>%
+  mutate(seqsample_before_2nd_regimen = case_when(
+    str_detect(seq_sample_chemo, "Yes") &
+      specimen_collection_dt <= treatment_start_dt_regimen_2        ~ "post-sample before 2nd regimen",
+    str_detect(seq_sample_chemo, "Yes") &
+      specimen_collection_dt > treatment_start_dt_regimen_2         ~ "post-sample after 2nd regimen"
+  )) %>%
+  # group to use first
+  group_by(deidentified_patient_id, seq_sample_chemo) %>%
+  mutate(is_first_seq_sample = case_when(
+    str_detect(seq_sample_chemo, "Yes") &
+    specimen_collection_dt == first(specimen_collection_dt)         ~ "Yes",
+    TRUE                                                            ~ NA_character_
+  )) %>%
+  ungroup() %>% 
+  mutate(seqsample_id_chemo = case_when(
+    is_first_seq_sample == "Yes"                                    ~ sample_id
+  )) %>%
+  mutate(seqsample_date_chemo = case_when(
+    !is.na(seqsample_id_chemo)                                      ~ specimen_collection_dt
+  )) %>%
+  
+  mutate(have_good_seqsample_chemo = case_when(
+    !is.na(seqsample_id_chemo)                                       ~ "Yes"
+  )) %>%
+  mutate(time_chemo_seqsample = case_when(
+    !is.na(seqsample_id_chemo)        ~ (
+      interval(start = treatment_start_dt_regimen_1, end = specimen_collection_dt) /
+        duration(n= 1, units = "days")
+    ))) %>%
+  mutate(interval_prepost_sample_chemo = case_when(
+    !is.na(seqsample_id_chemo)                                     ~
+      abs(interval(start = closest_chemo_presample_date, end = specimen_collection_dt) /
+                 duration(n = 1, units = "days"))
+  )) %>% 
+  group_by(deidentified_patient_id, presample_chemo_within_limits) %>% 
+  fill(presample_id_chemo, presample_date_chemo,
+       interval_presample_chemo,
+       seq_sample_chemo, seqsample_id_chemo, seqsample_date_chemo,
+       time_chemo_seqsample, interval_prepost_sample_chemo,
+       .direction = "updown") %>%
+  ungroup() %>% 
+  
+  select(deidentified_patient_id, specimen_collection_dt, has_a_good_presample_chemo, presample_chemo_within_limits, presample_id_chemo, presample_date_chemo,interval_presample_chemo, seq_sample_chemo, is_first_seq_sample, seqsample_id_chemo,seqsample_date_chemo,
+         treatment_start_dt_regimen_1, treatment_end_dt1_regimen_1, time_chemo_seqsample, interval_prepost_sample_chemo, everything()) %>% 
+  distinct(deidentified_patient_id, .keep_all = TRUE)
+```
+
+# I. Data Exploration
+## Missing stop date in selected patients?
+```{r}
+blood_patients %>% 
+  filter(!is.na(seqsample_id_chemo)) %>% 
+  mutate(missing_stop_date = case_when(
+    is.na(treatment_end_dt1_regimen_1)      ~ "missing",
+    TRUE                                 ~ "has chemo date"
+  )) %>% 
+  ggplot(aes(x= missing_stop_date)) +
+  geom_bar()+
+  theme_minimal(base_size = 14) +
+  labs(y="Number of Patient",
+       title = "Patients who have a pre AND sequential sample \n/ Chemotherapy")
+```
+
+## What is the duration of the first regimen from start date to last stop date
+```{r}
+blood_patients %>% 
+  filter(!is.na(seqsample_id_chemo)) %>% 
+  mutate(regimen_duration = interval(start = treatment_start_dt_regimen_1, end = treatment_end_dt1_regimen_1)/
+           duration(n=1, units = "days")) %>% 
+  ggplot(aes(x= regimen_duration)) +
+  geom_histogram(binwidth = 7, alpha = 0.9, position = "stack", fill= "darkgreen") +
+  theme_minimal(base_size = 14) +
+  labs(x="First regimen duration (in days)",
+       y="Number of Patient",
+       caption = "Each bar represents 7 days",
+       title = "Patients who have a pre AND sequential sample \n/ Chemotherapy")
+```
+
+## What is the duration of the first regimen from start date to last stop date
+```{r}
+blood_patients %>% 
+  filter(!is.na(seqsample_id_chemo) & is.na(treatment_end_dt1_regimen_1)) %>% 
+  mutate(regimen_duration = interval(start = treatment_start_dt_regimen_1, end = treatment_start_dt_regimen_2)/
+           duration(n=1, units = "days")) %>% 
+  ggplot(aes(x= regimen_duration)) +
+  geom_histogram() +
+  theme_minimal(base_size = 14) +
+  labs(x="Time between First regimen and 2nd regimen (in days)",
+       y="Number of Patient",
+       caption = "Each bar represents 7 days",
+       title = "Patients who have a pre AND sequential sample \n/ Chemotherapy")
+```
+
+# II. Table patients with Blood before and after treatment
+```{r}
+tbl1_1 <- blood_patients %>% 
+  select(Chemotherapy = has_a_good_presample_chemo) %>% 
+  tbl_summary(statistic = list(all_categorical() ~ "{n}")) %>% 
+  modify_header(update = list(
+  stat_0 ~ '**Patients with Blood before Treatment**'
+))
+tbl1_2 <- blood_patients %>% 
+  filter(!is.na(seqsample_id_chemo)) %>%
+  
+  distinct(deidentified_patient_id, .keep_all = TRUE) %>% 
+  select(Chemotherapy = seq_sample_chemo) %>% 
+  tbl_summary(statistic = list(all_categorical() ~ "{n}")) %>% 
+  modify_header(update = list(
+  stat_0 ~ '**Patients with Sequential Blood after Treatment(s)**'
+))
+tbl_merge(list(tbl1_1, tbl1_2)) %>% 
+  modify_spanning_header(everything() ~ NA_character_)
+```
+
+
+
+
+
+
+
+
+
+
